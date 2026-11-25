@@ -1107,6 +1107,187 @@
         if (/\b(body|bodies|figure|build|built|shape|physique|frame|silhouette)\b/.test(text)) return 'torso';
         return 'face';
     }
+    // ---------------------------------------------------------------------------
+    // Impression particles shown on the persona in immersive VR
+    // ---------------------------------------------------------------------------
+    // A permanent field of white particles on the persona surface, plus one glowing THREE.Points
+    // cloud per impression. Every call adds a new cloud instead of recolouring the old ones, so
+    // previous and new contributions stay visible together.
+    const PARTICLE_COUNT = 100;
+    const PARTICLE_SIZE = 0.02;
+    const PARTICLE_PATCH_RADIUS = 0.06;
+    const PARTICLE_WHITE = new THREE.Color(0xffffff);
+    let particleSprite;
+    /** Soft round sprite so particles look like glowing dots instead of squares. */
+    function getParticleSprite() {
+        if (particleSprite) return particleSprite;
+        const size = 64;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+        gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+        gradient.addColorStop(0.35, 'rgba(255, 255, 255, 0.9)');
+        gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, size, size);
+        particleSprite = new THREE.CanvasTexture(canvas);
+        particleSprite.colorSpace = THREE.SRGBColorSpace;
+        return particleSprite;
+    }
+    class ImpressionParticles {
+        group = new THREE.Group();
+        basePoints;
+        baseGeometry;
+        baseMaterial;
+        basePositions;
+        basePhases;
+        baseFlashColor = new THREE.Color(0xffffff);
+        baseFlashStart = -Infinity;
+        effects = [];
+        constructor(persona) {
+            this.persona = persona;
+            this.group.name = 'impression-particles';
+            this.group.visible = false;
+            this.createBaseField();
+            persona.mesh.add(this.group);
+        }
+        /** 100 white particles spread over the outside of the persona. */
+        createBaseField() {
+            const parts = this.persona.skinParts.filter((part) => part.geometry?.getAttribute('position'));
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const point = new THREE.Vector3();
+            const normal = new THREE.Vector3();
+            const normalMatrix = new THREE.Matrix3();
+            for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+                const part = parts[Math.floor(Math.random() * parts.length)];
+                const attribute = part.geometry.getAttribute('position');
+                const normals = part.geometry.getAttribute('normal');
+                const index = Math.floor(Math.random() * attribute.count);
+                part.updateMatrix();
+                point.fromBufferAttribute(attribute, index).applyMatrix4(part.matrix);
+                if (normals) {
+                    normalMatrix.getNormalMatrix(part.matrix);
+                    normal.fromBufferAttribute(normals, index).applyMatrix3(normalMatrix).normalize();
+                    point.addScaledVector(normal, 0.008);
+                }
+                positions[i * 3] = point.x;
+                positions[i * 3 + 1] = point.y;
+                positions[i * 3 + 2] = point.z;
+            }
+            this.basePositions = positions;
+            this.basePhases = Float32Array.from({ length: PARTICLE_COUNT }, () => Math.random() * Math.PI * 2);
+            this.baseGeometry = new THREE.BufferGeometry();
+            this.baseGeometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+            this.baseMaterial = new THREE.PointsMaterial({
+                color: 0xffffff,
+                size: PARTICLE_SIZE,
+                sizeAttenuation: true,
+                map: getParticleSprite(),
+                transparent: true,
+                opacity: 0.5,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending,
+            });
+            this.basePoints = new THREE.Points(this.baseGeometry, this.baseMaterial);
+            this.basePoints.name = 'impression-particle-field';
+            this.basePoints.frustumCulled = false;
+            this.group.add(this.basePoints);
+        }
+        /**
+         * Adds a glowing particle patch of the given colour at a free persona spot. The base field
+         * flashes that colour, then fades back to white; the patch itself keeps the colour.
+         */
+        spawnPatch(color, spot, region = 'face') {
+            const baseColor = new THREE.Color(color);
+            const hsl = { h: 0, s: 0, l: 0 };
+            baseColor.getHSL(hsl);
+            // Lift dark category colours so the additive particles read as glowing.
+            baseColor.setHSL(hsl.h, Math.min(0.95, Math.max(0.75, hsl.s)), Math.min(0.85, Math.max(0.55, hsl.l)));
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = new Float32Array(PARTICLE_COUNT * 3);
+            const phases = new Float32Array(PARTICLE_COUNT);
+            const radius = PARTICLE_PATCH_RADIUS * (PART_FIT[spot.part]?.size ?? 1);
+            const tint = new THREE.Color();
+            for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+                const i3 = i * 3;
+                const angle = Math.random() * Math.PI * 2;
+                const distance = radius * Math.sqrt(Math.random());
+                positions[i3] = Math.cos(angle) * distance;
+                positions[i3 + 1] = Math.sin(angle) * distance;
+                positions[i3 + 2] = 0.004 + Math.random() * 0.02;
+                tint.copy(baseColor).offsetHSL(0, 0, (Math.random() - 0.5) * 0.2);
+                colors[i3] = tint.r;
+                colors[i3 + 1] = tint.g;
+                colors[i3 + 2] = tint.b;
+                phases[i] = Math.random() * Math.PI * 2;
+            }
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions.slice(), 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            const material = new THREE.PointsMaterial({
+                size: PARTICLE_SIZE,
+                sizeAttenuation: true,
+                vertexColors: true,
+                map: getParticleSprite(),
+                transparent: true,
+                opacity: 1,
+                depthWrite: false,
+                blending: THREE.NormalBlending,
+            });
+            const points = new THREE.Points(geometry, material);
+            points.name = `impression-particles-${Date.now()}`;
+            points.position.copy(spot.position);
+            points.quaternion.copy(spot.quaternion);
+            points.frustumCulled = false;
+            points.userData.size = PART_FIT[spot.part]?.size ?? 1;
+            points.userData.part = spot.part;
+            points.userData.region = region;
+            points.userData.radius = radius;
+            this.group.add(points);
+            this.effects.push({ points, geometry, material, positions, phases, born: performance.now() });
+            this.baseFlashColor.copy(baseColor);
+            this.baseFlashStart = performance.now();
+            return points;
+        }
+        /** Gentle floating and blinking for every particle cloud that exists. */
+        update(now) {
+            if (!this.group.visible) return;
+            const t = now * 0.001;
+            const flashAge = (now - this.baseFlashStart) / 1600;
+            const flash = flashAge < 1 ? 1 - flashAge : 0;
+            const attribute = this.baseGeometry.getAttribute('position');
+            for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+                const i3 = i * 3;
+                const phase = this.basePhases[i];
+                attribute.array[i3] = this.basePositions[i3] + Math.sin(t * 0.9 + phase) * 0.006;
+                attribute.array[i3 + 1] = this.basePositions[i3 + 1] + Math.cos(t * 0.7 + phase * 1.3) * 0.006;
+                attribute.array[i3 + 2] = this.basePositions[i3 + 2] + Math.sin(t * 0.6 + phase * 0.7) * 0.004;
+            }
+            attribute.needsUpdate = true;
+            this.baseMaterial.color.copy(this.baseFlashColor).lerp(PARTICLE_WHITE, Math.min(flashAge, 1));
+            this.baseMaterial.opacity = 0.35 + 0.15 * (0.5 + 0.5 * Math.sin(t * 1.6)) + flash * 0.4;
+            for (const effect of this.effects) {
+                const points = effect.geometry.getAttribute('position');
+                const swell = 1 + Math.max(0, 1 - (now - effect.born) / 700) * 0.6;
+                for (let i = 0; i < PARTICLE_COUNT; i += 1) {
+                    const i3 = i * 3;
+                    const phase = effect.phases[i];
+                    points.array[i3] = (effect.positions[i3] + Math.sin(t * 1.1 + phase) * 0.004) * swell;
+                    points.array[i3 + 1] = (effect.positions[i3 + 1] + Math.cos(t * 0.9 + phase * 1.4) * 0.004) * swell;
+                    points.array[i3 + 2] = (effect.positions[i3 + 2] + (0.5 + 0.5 * Math.sin(t * 1.3 + phase)) * 0.006) * swell;
+                }
+                points.needsUpdate = true;
+                effect.material.opacity = 0.82 + 0.18 * (0.5 + 0.5 * Math.sin(t * 2.2 + effect.phases[0]));
+            }
+        }
+        show() {
+            this.group.visible = true;
+        }
+        hide() {
+            this.group.visible = false;
+        }
+    }
     // Meta Quest Browser exposes no working speech recognition, so it uses the laptop voice station.
     function useLaptopVoiceStation() {
         const forced = new URLSearchParams(window.location.search).get('voice');
@@ -1132,6 +1313,7 @@
         raycaster = new THREE.Raycaster();
         growingPatches = [];
         patches = [];
+        impressions;
         vr = null;
         constructor() {
             const appElement = document.getElementById('app');
@@ -1162,6 +1344,7 @@
             this.scene.add(rimLight);
             this.persona = new PersonaModel();
             this.scene.add(this.persona.mesh);
+            this.impressions = new ImpressionParticles(this.persona);
             this.xrPanel.mesh.visible = false;
             this.scene.add(this.xrPanel.mesh);
             this.scene.add(this.vrPanel.group);
@@ -1432,10 +1615,12 @@
                     // The in-world panel is only shown during actual VR sessions.
                     this.vrSessionActive = true;
                     this.vrPanel.show();
+                    this.impressions.show();
                 },
                 onSessionEnd: () => {
                     this.vrSessionActive = false;
                     this.vrPanel.hide();
+                    this.impressions.hide();
                     this.resetPersonaPlacement();
                     this.frameCamera();
                 },
@@ -1503,13 +1688,25 @@
             }
             micButton.addEventListener('click', () => voice.toggle());
         }
+        /** Adds a glowing particle impression of `color` at a free spot; earlier ones stay. */
+        spawnPatch(color, region = 'face') {
+            const spot = this.findFreePatchSpot(region, PARTICLE_PATCH_RADIUS);
+            const points = this.impressions.spawnPatch(color, spot, region);
+            this.patches.push(points);
+            return points;
+        }
         /**
-         * Adds one impression patch where the impression points: a named body part ("his hands"
+         * Adds one impression where the impression points: a named body part ("his hands"
          * -> hands), a part people link with the words ("so fat" -> belly), the body in general
-         * (torso), or else the face. It lands on the closest free spot to that point.
+         * (torso), or else the face. It lands on the closest free spot to that point, as a glowing
+         * particle cloud in VR and as the original coloured patch outside VR.
          */
         addPatch(category, transcript = '') {
             const region = regionFromTranscript(transcript);
+            if (this.vrSessionActive) {
+                this.spawnPatch(CATEGORY_COLORS[category], region);
+                return;
+            }
             const spot = this.findFreePatchSpot(region);
             const patch = PatchGenerator.createPatch(category);
             const size = PART_FIT[spot.part]?.size ?? 1;
@@ -1531,7 +1728,7 @@
          * existing patch, so patches never overlap. When the wanted parts are full, the patch moves
          * on to the rest of the body.
          */
-        findFreePatchSpot(region) {
+        findFreePatchSpot(region, candidateRadius = PATCH_HALF_DIAGONAL) {
             const model = this.persona.mesh;
             model.updateMatrixWorld(true);
             const toLocal = model.matrixWorld.clone().invert();
@@ -1540,10 +1737,10 @@
             const probe = new THREE.Object3D(); // stand-in patch used to test each spot
             model.add(probe);
             const spotInfo = SPOTS[region] ?? SPOTS.face;
-            const patchRadius = (part) => PATCH_HALF_DIAGONAL * (PART_FIT[part]?.size ?? 1);
-            // Positive when the spot is free: room left after both patches' half-diagonals.
+            const patchRadius = (part) => candidateRadius * (PART_FIT[part]?.size ?? 1);
+            // Positive when the spot is free: room left after both patches' radii.
             const room = (c) => this.patches.reduce(
-                (min, p) => Math.min(min, p.position.distanceTo(c.position) - patchRadius(c.part) - PATCH_HALF_DIAGONAL * p.userData.size),
+                (min, p) => Math.min(min, p.position.distanceTo(c.position) - (p.userData.radius ?? PATCH_HALF_DIAGONAL * p.userData.size) - patchRadius(c.part)),
                 Infinity,
             );
             // Look at points around the anchor from the front (or the outer side for parts on the
@@ -1683,6 +1880,7 @@
                 }
                 const now = performance.now();
                 this.updatePatches(now);
+                this.impressions.update(now);
                 this.vr?.update();
                 if (this.arSessionActive || this.vrSessionActive) {
                     this.updateXRInput();
@@ -1782,6 +1980,10 @@
     else {
         const app = new App();
         window.app = app; // handy for debugging in the browser console
+        window.spawnPatch = (color, region) => {
+            app.impressions.show();
+            return app.spawnPatch(color, region);
+        };
         window.startSpeechRecognition = () => app.startSpeechRecognition();
         window.THREE = THREE;
     }
