@@ -773,6 +773,230 @@
     }
 
     // ---------------------------------------------------------------------------
+    // In-world question panel for immersive VR (Meta Quest)
+    // ---------------------------------------------------------------------------
+    // White, slightly transparent card with the question, the three impression buttons and the
+    // "Press and Speak" button. The panel hangs to the left of the eye line so it never covers
+    // the persona. World coordinates rely on the 'local-floor' origin: floor, start position,
+    // facing -Z at session start.
+    const VR_PANEL_WIDTH_M = 0.76;
+    const VR_PANEL_HEIGHT_M = 0.318;
+    const VR_PANEL_CSS_WIDTH = 600;
+    const VR_PANEL_CSS_HEIGHT = 251;
+    const VR_PANEL_POSITION = new THREE.Vector3(-0.68, 1.52, -1.18);
+    const VR_PANEL_YAW = 0.35; // turns the panel back towards the participant
+    const VR_QUESTION_TEXT = 'What is your first impression about this person?';
+    const VR_QUESTION_FONT = `"Bitcount Single", ${FONT_FAMILY}`;
+    const VR_BUTTON_FONT = `"DM Sans", ${FONT_FAMILY}`;
+    const VR_CHOICES = [
+        { action: 'Negative', label: 'Distant', background: '#263A72', color: '#ffffff' },
+        { action: 'Neutral', label: 'Calm', background: '#87CEEB', color: '#333333' },
+        { action: 'Positive', label: 'Friendly', background: '#E88AB8', color: '#ffffff' },
+    ];
+    const VR_VOICE_IDLE_BG = '#d9c7ff';
+    const VR_VOICE_IDLE_TEXT = '#3b2a63';
+    const VR_VOICE_PRESSED_BG = '#7bd88f';
+    const VR_VOICE_PRESSED_TEXT = '#14532d';
+    const VR_PRESSED_MS = 900;
+    const vrCssToM = (css) => (VR_PANEL_WIDTH_M * css) / VR_PANEL_CSS_WIDTH;
+    class VRQuestionPanel {
+        group = new THREE.Group();
+        card;
+        cardCanvas;
+        cardCtx;
+        cardTexture;
+        buttons = [];
+        voice;
+        hitTargets = [];
+        hovered = null;
+        pressedAction = null;
+        pressedUntil = 0;
+        constructor() {
+            this.group.name = 'vr-question-panel';
+            this.group.position.copy(VR_PANEL_POSITION);
+            this.group.rotation.y = VR_PANEL_YAW;
+            this.group.visible = false;
+            this.createCard();
+            const buttonWidth = vrCssToM(160);
+            const buttonHeight = vrCssToM(60);
+            const gap = vrCssToM(21);
+            const totalWidth = buttonWidth * 3 + gap * 2;
+            VR_CHOICES.forEach((choice, index) => {
+                const button = this.createTextButton({
+                    action: choice.action,
+                    label: choice.label,
+                    background: choice.background,
+                    color: choice.color,
+                    cssWidth: 160,
+                    cssHeight: 60,
+                    width: buttonWidth,
+                    height: buttonHeight,
+                    x: -totalWidth / 2 + buttonWidth / 2 + index * (buttonWidth + gap),
+                    y: vrCssToM(-190),
+                });
+                this.buttons.push(button);
+                this.hitTargets.push(button.mesh);
+            });
+            this.voice = this.createTextButton({
+                action: 'voice',
+                label: 'Press and Speak',
+                background: VR_VOICE_IDLE_BG,
+                color: VR_VOICE_IDLE_TEXT,
+                cssWidth: 280,
+                cssHeight: 70,
+                width: vrCssToM(280),
+                height: vrCssToM(70),
+                x: 0,
+                y: vrCssToM(-285),
+            });
+            this.hitTargets.push(this.voice.mesh);
+            this.group.add(...this.hitTargets);
+            void this.loadFonts();
+        }
+        createCard() {
+            this.cardCanvas = document.createElement('canvas');
+            this.cardCanvas.width = VR_PANEL_CSS_WIDTH * SCALE;
+            this.cardCanvas.height = VR_PANEL_CSS_HEIGHT * SCALE;
+            this.cardCtx = this.cardCanvas.getContext('2d');
+            this.cardTexture = new THREE.CanvasTexture(this.cardCanvas);
+            this.cardTexture.colorSpace = THREE.SRGBColorSpace;
+            this.cardTexture.anisotropy = 4;
+            this.card = new THREE.Mesh(
+                new THREE.PlaneGeometry(VR_PANEL_WIDTH_M, VR_PANEL_HEIGHT_M),
+                new THREE.MeshBasicMaterial({
+                    map: this.cardTexture,
+                    transparent: true,
+                    depthWrite: false,
+                    side: THREE.DoubleSide,
+                }),
+            );
+            this.card.name = 'vr-question-card';
+            this.card.renderOrder = 1;
+            this.group.add(this.card);
+            this.drawCard();
+        }
+        createTextButton({ action, label, background, color, cssWidth, cssHeight, width, height, x, y }) {
+            const canvas = document.createElement('canvas');
+            canvas.width = cssWidth * SCALE;
+            canvas.height = cssHeight * SCALE;
+            const ctx = canvas.getContext('2d');
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.anisotropy = 4;
+            const face = new THREE.MeshBasicMaterial({ map: texture, transparent: true, side: THREE.DoubleSide });
+            // Flat box: the textured face points at the participant, the thin edges stay solid.
+            const edge = new THREE.MeshBasicMaterial({ color: background });
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(width, height, 0.012), [edge, edge, edge, edge, face, edge]);
+            mesh.name = `vr-button-${action}`;
+            mesh.userData.action = action;
+            mesh.position.set(x, y, 0);
+            mesh.renderOrder = 2;
+            const button = { action, label, background, color, canvas, ctx, texture, edge, mesh, cssWidth, cssHeight };
+            this.drawButton(button);
+            return button;
+        }
+        drawCard() {
+            const ctx = this.cardCtx;
+            const w = VR_PANEL_CSS_WIDTH;
+            const h = VR_PANEL_CSS_HEIGHT;
+            ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            roundRect(ctx, 1, 1, w - 2, h - 2, 22);
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.12)';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.fillStyle = '#000000';
+            ctx.font = `700 36px ${VR_QUESTION_FONT}`;
+            const lines = wrapText(ctx, VR_QUESTION_TEXT, w - 70);
+            const lineHeight = 48;
+            const startY = h / 2 - ((lines.length - 1) * lineHeight) / 2;
+            lines.forEach((line, i) => ctx.fillText(line, w / 2, startY + i * lineHeight));
+            this.cardTexture.needsUpdate = true;
+        }
+        drawButton(button) {
+            const { ctx, cssWidth: w, cssHeight: h } = button;
+            const hovered = this.hovered === button.action;
+            const pressed = this.pressedAction === button.action;
+            const voice = button.action === 'voice';
+            const fill = pressed ? (voice ? VR_VOICE_PRESSED_BG : '#7bd88f') : button.background;
+            ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+            ctx.clearRect(0, 0, w, h);
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            roundRect(ctx, 0, 0, w, h, Math.min(14, h / 2));
+            ctx.fillStyle = fill;
+            ctx.fill();
+            if (hovered && !pressed) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+                ctx.fill();
+            }
+            if (hovered || pressed) {
+                ctx.strokeStyle = pressed ? 'rgba(20, 83, 45, 0.85)' : 'rgba(255, 255, 255, 0.95)';
+                ctx.lineWidth = 3;
+                ctx.stroke();
+            }
+            ctx.fillStyle = pressed ? (voice ? VR_VOICE_PRESSED_TEXT : '#14401f') : button.color;
+            ctx.font = `700 ${voice ? 28 : 26}px ${VR_BUTTON_FONT}`;
+            ctx.fillText(button.label, w / 2, h / 2 + 1);
+            button.texture.needsUpdate = true;
+            button.edge.color.set(fill);
+        }
+        /** Returns the button under a controller ray, or null. */
+        hitAt(raycaster) {
+            const hit = raycaster.intersectObjects(this.hitTargets, false)[0];
+            if (!hit) return null;
+            return { action: hit.object.userData.action, point: hit.point, distance: hit.distance };
+        }
+        setHovered(action) {
+            if (action === this.hovered) return;
+            this.hovered = action;
+            this.redraw();
+        }
+        flashPressed(action) {
+            this.pressedAction = action;
+            this.pressedUntil = performance.now() + VR_PRESSED_MS;
+            this.redraw();
+        }
+        update(now) {
+            if (!this.pressedAction || now < this.pressedUntil) return;
+            this.pressedAction = null;
+            this.redraw();
+        }
+        redraw() {
+            for (const button of [...this.buttons, this.voice]) {
+                if (button) this.drawButton(button);
+            }
+        }
+        show() {
+            this.group.visible = true;
+        }
+        hide() {
+            this.group.visible = false;
+            this.hovered = null;
+            this.pressedAction = null;
+            this.redraw();
+        }
+        async loadFonts() {
+            if (!document.fonts?.load) return;
+            try {
+                await Promise.all([
+                    document.fonts.load(`700 36px "Bitcount Single"`),
+                    document.fonts.load(`700 28px "DM Sans"`),
+                ]);
+            }
+            catch {
+                // Keep the system fallback when the web fonts cannot be loaded.
+            }
+            this.drawCard();
+            this.redraw();
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Installation page (index.html)
     // ---------------------------------------------------------------------------
     // AR uses the 'local-floor' reference space: its origin is on the floor under the
@@ -902,6 +1126,8 @@
         pendingARPlacement = false;
         arSessionActive = false;
         xrPanel = new XRPanel();
+        vrPanel = new VRQuestionPanel();
+        vrSessionActive = false;
         controllers = [];
         raycaster = new THREE.Raycaster();
         growingPatches = [];
@@ -938,6 +1164,7 @@
             this.scene.add(this.persona.mesh);
             this.xrPanel.mesh.visible = false;
             this.scene.add(this.xrPanel.mesh);
+            this.scene.add(this.vrPanel.group);
             this.initUI();
             this.frameCamera();
             new ResizeObserver(() => this.frameCamera()).observe(this.uiOverlay);
@@ -1008,6 +1235,12 @@
                     controller.userData.active = false;
                 });
                 controller.addEventListener('select', () => {
+                    if (this.vrSessionActive) {
+                        const hit = this.intersectVRPanel(controller);
+                        if (hit?.action)
+                            this.handleVRPanelAction(hit.action);
+                        return;
+                    }
                     const action = this.panelActionFor(controller);
                     if (action)
                         this.handlePanelAction(action);
@@ -1028,18 +1261,33 @@
             this.raycaster.ray.direction.set(0, 0, -1).transformDirection(controller.matrixWorld);
             return this.raycaster.intersectObject(this.xrPanel.mesh, false)[0] ?? null;
         }
+        intersectVRPanel(controller) {
+            if (!this.vrSessionActive || !this.vrPanel.group.visible || !controller.userData.active)
+                return null;
+            controller.updateMatrixWorld();
+            this.raycaster.setFromXRController(controller);
+            return this.vrPanel.hitAt(this.raycaster);
+        }
+        /** Hit on the AR panel, with the button action under the ray. */
+        xrPanelHit(controller) {
+            const hit = this.intersectPanel(controller);
+            if (!hit)
+                return null;
+            return { point: hit.point, distance: hit.distance, action: hit.uv ? this.xrPanel.actionAt(hit.uv) : null };
+        }
         updateXRInput() {
             let hovered = null;
             for (const controller of this.controllers) {
                 const cursor = controller.userData.cursor;
                 const ray = controller.getObjectByName('ray');
-                const hit = this.intersectPanel(controller);
+                const hit = this.vrSessionActive ? this.intersectVRPanel(controller) : this.xrPanelHit(controller);
                 if (hit) {
                     cursor.position.copy(hit.point);
                     cursor.visible = true;
                     if (ray)
                         ray.scale.z = hit.distance;
-                    hovered = hit.uv ? this.xrPanel.actionAt(hit.uv) ?? hovered : hovered;
+                    if (hit.action)
+                        hovered = hit.action;
                 }
                 else {
                     cursor.visible = false;
@@ -1047,7 +1295,10 @@
                         ray.scale.z = 2;
                 }
             }
-            this.xrPanel.setHovered(hovered);
+            if (this.vrSessionActive)
+                this.vrPanel.setHovered(hovered);
+            else
+                this.xrPanel.setHovered(hovered);
         }
         handlePanelAction(action) {
             this.xrPanel.flashPressed(action);
@@ -1057,6 +1308,26 @@
             else {
                 this.addPatch(action);
             }
+        }
+        handleVRPanelAction(action) {
+            this.vrPanel.flashPressed(action);
+            if (action === 'voice') {
+                console.log('Voice button pressed');
+                this.startSpeechRecognition();
+            }
+            else {
+                this.addPatch(action);
+            }
+        }
+        /** Starts listening from the in-world voice button (never stops an active recording). */
+        startSpeechRecognition() {
+            const micButton = document.getElementById('btn-voice');
+            if (!micButton || micButton.disabled)
+                return;
+            const status = document.getElementById('voice-status');
+            if (status?.dataset.state === 'listening')
+                return;
+            micButton.click();
         }
         initAR() {
             this.renderer.xr.setReferenceSpaceType('local-floor');
@@ -1158,8 +1429,13 @@
                     this.persona.mesh.position.set(0, 0, -1.5);
                     this.persona.mesh.rotation.set(0, 0, 0);
                     this.persona.mesh.scale.setScalar(1);
+                    // The in-world panel is only shown during actual VR sessions.
+                    this.vrSessionActive = true;
+                    this.vrPanel.show();
                 },
                 onSessionEnd: () => {
+                    this.vrSessionActive = false;
+                    this.vrPanel.hide();
                     this.resetPersonaPlacement();
                     this.frameCamera();
                 },
@@ -1408,9 +1684,11 @@
                 const now = performance.now();
                 this.updatePatches(now);
                 this.vr?.update();
-                if (this.arSessionActive) {
+                if (this.arSessionActive || this.vrSessionActive) {
                     this.updateXRInput();
-                    this.xrPanel.update(now);
+                    if (this.arSessionActive)
+                        this.xrPanel.update(now);
+                    this.vrPanel.update(now);
                 }
                 this.renderer.render(this.scene, this.camera);
             });
@@ -1504,6 +1782,7 @@
     else {
         const app = new App();
         window.app = app; // handy for debugging in the browser console
+        window.startSpeechRecognition = () => app.startSpeechRecognition();
         window.THREE = THREE;
     }
 })();
